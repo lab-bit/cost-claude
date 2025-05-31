@@ -1,0 +1,85 @@
+{
+  "name": "cost-claude",
+  "version": "0.4.1",
+  "description": "Claude Code cost monitoring, analytics, and optimization toolkit",
+  "main": "dist/cli/index.js",
+  "type": "module",
+  "preferGlobal": true,
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "dev": "tsx src/cli/index.ts",
+    "dev:watch": "tsx watch src/cli/index.ts",
+    "build": "tsc",
+    "start": "node dist/cli/index.js",
+    "test": "vitest",
+    "lint": "eslint src --ext .ts",
+    "format": "prettier --write src/**/*.ts",
+    "typecheck": "tsc --noEmit",
+    "cost-claude": "node dist/cli/index.js",
+    "debug:watcher": "tsx scripts/debug-watcher.ts",
+    "debug:state": "tsx scripts/reset-watcher-state.ts",
+    "test:watcher": "tsx src/test-watcher.ts",
+    "test:notification": "tsx scripts/test-notification.ts",
+    "test:session": "tsx scripts/test-session-detector.ts",
+    "test:mac-notification": "tsx scripts/test-mac-notification.ts"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "cost",
+    "monitoring",
+    "analytics",
+    "notification",
+    "cli"
+  ],
+  "author": "Lab Bit",
+  "license": "MIT",
+  "homepage": "https://github.com/lab-bit/claude-code-cost-checker#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lab-bit/claude-code-cost-checker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lab-bit/claude-code-cost-checker/issues"
+  },
+  "bin": {
+    "cost-claude": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/glob": "^8.1.0",
+    "@types/node": "^22.15.26",
+    "@types/node-notifier": "^8.0.5",
+    "@typescript-eslint/eslint-plugin": "^8.33.0",
+    "@typescript-eslint/parser": "^8.33.0",
+    "@vitest/ui": "^3.1.4",
+    "eslint": "^9.27.0",
+    "prettier": "^3.5.3",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.4"
+  },
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "chokidar": "^4.0.3",
+    "commander": "^14.0.0",
+    "dotenv": "^16.5.0",
+    "duckdb": "^1.2.1",
+    "glob": "^11.0.2",
+    "node-fetch": "^2.7.0",
+    "node-notifier": "^10.0.1",
+    "open": "^10.1.2",
+    "ora": "^8.2.0",
+    "winston": "^3.17.0"
+  }
+}
