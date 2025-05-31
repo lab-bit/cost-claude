@@ -1,6 +1,6 @@
 {
   "name": "cost-claude",
-  "version": "0.4.1",
+  "version": "0.1.0",
   "description": "Claude Code cost monitoring, analytics, and optimization toolkit",
   "main": "dist/cli/index.js",
   "type": "module",

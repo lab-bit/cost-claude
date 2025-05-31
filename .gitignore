@@ -48,7 +48,13 @@ Thumbs.db
 # Generated files
 *.js.map
 *.d.ts.map
-data/claude_25052902.csv
+
+# Documentation
 docs/*.md
 
+# Personal data - NEVER commit actual Claude usage data
+data/
+*.csv
+
+# Local documentation
 CLAUDE.md
