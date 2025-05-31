@@ -9,18 +9,14 @@ Cost Claude monitors and analyzes your Claude Code usage costs in real-time with
 
 ## 🚀 Quick Start
 
-### Using npx/bunx (Recommended)
+### Using npx (Recommended)
 
 ```bash
 # Real-time monitoring with notifications
 npx cost-claude@latest watch --notify
 
 # Quick analysis with npx
-npx cost-claude@latest analyze
-
-# Using bunx
-bunx cost-claude analyze
-bunx cost-claude watch --notify
+npx cost-claude@latest analyzey
 ```
 
 ### Global Installation
