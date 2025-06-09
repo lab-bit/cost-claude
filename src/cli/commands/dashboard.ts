@@ -10,6 +10,24 @@ import { GroupAnalyzer } from '../../analytics/group-analyzer.js';
 import { CostPredictor } from '../../services/cost-predictor.js';
 import { UsageInsightsAnalyzer } from '../../services/usage-insights.js';
 
+/**
+ * Get the cost of a message, calculating from tokens if costUSD is null
+ */
+function getMessageCost(message: ClaudeMessage, parser: JSONLParser, calculator: CostCalculator): number {
+  // First try to use the pre-calculated costUSD if available and not null
+  if (message.costUSD !== null && message.costUSD !== undefined) {
+    return message.costUSD;
+  }
+  
+  // Fallback: calculate cost from token usage
+  const content = parser.parseMessageContent(message);
+  if (content?.usage) {
+    return calculator.calculate(content.usage);
+  }
+  
+  return 0;
+}
+
 export interface DashboardOptions {
   path?: string;
   port?: string;
@@ -102,7 +120,12 @@ async function getAnalysisData(projectPath: string) {
   const messages = await parser.parseDirectory(projectPath);
   
   // Calculate basic stats
-  const totalCost = messages.reduce((sum: number, msg: ClaudeMessage) => sum + (msg.costUSD || 0), 0);
+  const totalCost = messages.reduce((sum: number, msg: ClaudeMessage) => {
+    if (msg.type === 'assistant') {
+      return sum + getMessageCost(msg, parser, calculator);
+    }
+    return sum;
+  }, 0);
   const messageCount = messages.length;
   
   // Group by date for chart
@@ -148,15 +171,16 @@ async function getAnalysisData(projectPath: string) {
     predictions,
     insights: topInsights,
     recentMessages: messages
-      .filter((msg: ClaudeMessage) => msg.costUSD && msg.costUSD > 0)
-      .sort((a: ClaudeMessage, b: ClaudeMessage) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-      .slice(0, 20)
+      .filter((msg: ClaudeMessage) => msg.type === 'assistant')
       .map((msg: ClaudeMessage) => ({
         timestamp: msg.timestamp,
-        cost: msg.costUSD,
+        cost: getMessageCost(msg, parser, calculator),
         sessionId: msg.sessionId?.substring(0, 8) + '...',
         type: msg.type
       }))
+      .filter(msg => msg.cost > 0)
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .slice(0, 20)
   };
 }
 

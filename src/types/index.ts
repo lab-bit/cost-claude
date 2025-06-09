@@ -37,6 +37,7 @@ export interface MessageContent {
     service_tier?: string;
     server_tool_use?: any;
   };
+  ttftMs?: number;
 }
 
 export interface RateConfig {

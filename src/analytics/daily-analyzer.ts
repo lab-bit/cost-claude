@@ -35,8 +35,13 @@ export class DailyAnalyzer {
 
     // Filter messages for the target date
     const dayMessages = messages.filter((msg) => {
-      const msgDate = new Date(msg.timestamp).toISOString().split('T')[0];
-      return msgDate === dateStr;
+      try {
+        const msgDate = new Date(msg.timestamp).toISOString().split('T')[0];
+        return msgDate === dateStr;
+      } catch {
+        // Skip messages with invalid timestamps
+        return false;
+      }
     });
 
     // Get assistant messages only
@@ -50,10 +55,23 @@ export class DailyAnalyzer {
     const hourCosts: number[] = new Array(24).fill(0);
 
     assistantMessages.forEach((msg) => {
-      if (msg.costUSD) {
-        totalCost += msg.costUSD;
+      let msgCost = 0;
+      
+      // First try to use the pre-calculated costUSD if available and not null
+      if (msg.costUSD !== null && msg.costUSD !== undefined) {
+        msgCost = msg.costUSD;
+      } else {
+        // Fallback: calculate cost from token usage
+        const content = this.parser.parseMessageContent(msg);
+        if (content?.usage) {
+          msgCost = this.calculator.calculate(content.usage);
+        }
+      }
+      
+      if (msgCost > 0) {
+        totalCost += msgCost;
         const hour = new Date(msg.timestamp).getHours();
-        hourCosts[hour]! += msg.costUSD;
+        hourCosts[hour]! += msgCost;
       }
 
       const content = this.parser.parseMessageContent(msg);
@@ -108,7 +126,16 @@ export class DailyAnalyzer {
       let totalTokens = 0;
 
       sessionAssistantMessages.forEach((msg) => {
-        if (msg.costUSD) sessionCost += msg.costUSD;
+        // First try to use the pre-calculated costUSD if available and not null
+        if (msg.costUSD !== null && msg.costUSD !== undefined) {
+          sessionCost += msg.costUSD;
+        } else {
+          // Fallback: calculate cost from token usage
+          const content = this.parser.parseMessageContent(msg);
+          if (content?.usage) {
+            sessionCost += this.calculator.calculate(content.usage);
+          }
+        }
         
         const content = this.parser.parseMessageContent(msg);
         if (content?.usage) {

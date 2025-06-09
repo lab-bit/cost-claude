@@ -66,7 +66,21 @@ export class SessionAnalyzer {
   }
 
   private calculateTotalCost(messages: ClaudeMessage[]): number {
-    return messages.reduce((sum, msg) => sum + (msg.costUSD || 0), 0);
+    return messages.reduce((sum, msg) => {
+      // First try to use the pre-calculated costUSD if available and not null
+      if (msg.costUSD !== null && msg.costUSD !== undefined) {
+        return sum + msg.costUSD;
+      }
+      
+      // Fallback: calculate cost from token usage
+      const content = this.parser.parseMessageContent(msg);
+      if (content?.usage) {
+        const cost = this.calculator.calculate(content.usage);
+        return sum + cost;
+      }
+      
+      return sum;
+    }, 0);
   }
 
   private calculateCostBreakdown(messages: ClaudeMessage[]) {

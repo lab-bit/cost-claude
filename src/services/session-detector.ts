@@ -1,6 +1,8 @@
 import { EventEmitter } from 'events';
 import { ClaudeMessage } from '../types/index.js';
 import { ProjectParser } from '../core/project-parser.js';
+import { JSONLParser } from '../core/jsonl-parser.js';
+import { CostCalculator } from '../core/cost-calculator.js';
 import { logger } from '../utils/logger.js';
 
 export interface SessionCompletionData {
@@ -23,15 +25,36 @@ export interface TaskCompletionData {
   assistantMessageCount: number;
   lastMessageUuid: string;
   timestamp: Date;
+  completionType: 'immediate' | 'delayed';
+}
+
+export interface TaskProgressData {
+  sessionId: string;
+  projectName: string;
+  currentCost: number;
+  currentDuration: number;
+  assistantMessageCount: number;
+  isActive: boolean;
+  estimatedCompletion?: number; // Estimated remaining time in ms
 }
 
 export interface SessionDetectorConfig {
   inactivityTimeout?: number; // Time in ms to consider session inactive
   summaryMessageTimeout?: number; // Time to wait after summary before considering complete
   taskCompletionTimeout?: number; // Time in ms after last assistant message to consider task complete
+  delayedTaskCompletionTimeout?: number; // Longer timeout for delayed task completion (default: 30s)
+  minTaskCost?: number; // Minimum cost to emit task completion event
+  minTaskMessages?: number; // Minimum assistant messages to consider a task
+  // Progress notification settings
+  enableProgressNotifications?: boolean; // Enable progress notifications for long tasks
+  progressCheckInterval?: number; // How often to check for progress (default: 10s)
+  minProgressCost?: number; // Minimum cost for progress notification
+  minProgressDuration?: number; // Minimum duration for progress notification (default: 15s)
 }
 
 export class SessionDetector extends EventEmitter {
+  private jsonlParser: JSONLParser;
+  private costCalculator: CostCalculator;
   private sessions: Map<string, {
     messages: ClaudeMessage[];
     totalCost: number;
@@ -45,20 +68,37 @@ export class SessionDetector extends EventEmitter {
     summaryTimer?: NodeJS.Timeout;
     inactivityTimer?: NodeJS.Timeout;
     taskTimer?: NodeJS.Timeout;
+    delayedTaskTimer?: NodeJS.Timeout;
+    progressTimer?: NodeJS.Timeout;
     currentTaskStartTime?: Date;
     currentTaskCost: number;
     currentTaskAssistantCount: number;
     lastAssistantMessageTime?: Date;
+    lastProgressNotificationTime?: Date;
+    taskInProgress: boolean;
   }> = new Map();
 
   private config: Required<SessionDetectorConfig>;
 
   constructor(config: SessionDetectorConfig = {}) {
     super();
+    this.jsonlParser = new JSONLParser();
+    this.costCalculator = new CostCalculator();
+    // Initialize cost calculator rates asynchronously
+    this.costCalculator.ensureRatesLoaded().catch(err => {
+      logger.error('Failed to load pricing rates:', err);
+    });
     this.config = {
       inactivityTimeout: config.inactivityTimeout ?? 300000, // 5 minutes default
       summaryMessageTimeout: config.summaryMessageTimeout ?? 5000, // 5 seconds after summary
       taskCompletionTimeout: config.taskCompletionTimeout ?? 3000, // 3 seconds after last assistant message
+      delayedTaskCompletionTimeout: config.delayedTaskCompletionTimeout ?? 30000, // 30 seconds for delayed completion
+      minTaskCost: config.minTaskCost ?? 0.01, // Minimum $0.01 to consider task significant
+      minTaskMessages: config.minTaskMessages ?? 1, // At least 1 assistant message
+      enableProgressNotifications: config.enableProgressNotifications ?? true,
+      progressCheckInterval: config.progressCheckInterval ?? 10000, // Check every 10 seconds
+      minProgressCost: config.minProgressCost ?? 0.02, // Minimum $0.02 for progress notification
+      minProgressDuration: config.minProgressDuration ?? 15000, // 15 seconds minimum
     };
   }
 
@@ -80,7 +120,8 @@ export class SessionDetector extends EventEmitter {
         hasSummary: false,
         filePath,
         currentTaskCost: 0,
-        currentTaskAssistantCount: 0
+        currentTaskAssistantCount: 0,
+        taskInProgress: false
       });
       logger.debug(`New session detected: ${sessionId} for project: ${projectName}`);
     }
@@ -102,6 +143,12 @@ export class SessionDetector extends EventEmitter {
     if (session.taskTimer) {
       clearTimeout(session.taskTimer);
     }
+    if (session.delayedTaskTimer) {
+      clearTimeout(session.delayedTaskTimer);
+    }
+    if (session.progressTimer) {
+      clearTimeout(session.progressTimer);
+    }
 
     // Process based on message type
     if (message.type === 'user') {
@@ -115,23 +162,48 @@ export class SessionDetector extends EventEmitter {
       session.currentTaskCost = 0;
       session.currentTaskAssistantCount = 0;
       session.lastAssistantMessageTime = undefined;
-    } else if (message.type === 'assistant' && message.costUSD) {
-      session.totalCost += message.costUSD;
+      session.taskInProgress = false;
+      session.lastProgressNotificationTime = undefined;
+    } else if (message.type === 'assistant') {
+      // Calculate message cost
+      let messageCost = 0;
+      if (message.costUSD !== null && message.costUSD !== undefined) {
+        messageCost = message.costUSD;
+      } else {
+        // Fallback: calculate cost from token usage
+        const content = this.jsonlParser.parseMessageContent(message);
+        if (content?.usage) {
+          messageCost = this.costCalculator.calculate(content.usage);
+        }
+      }
+      
+      session.totalCost += messageCost;
       
       // Update task tracking
       if (!session.currentTaskStartTime) {
         session.currentTaskStartTime = new Date(message.timestamp);
       }
-      session.currentTaskCost += message.costUSD;
+      session.currentTaskCost += messageCost;
       session.currentTaskAssistantCount++;
       session.lastAssistantMessageTime = new Date(message.timestamp);
+      session.taskInProgress = true;
       
-      // Set task completion timer
+      // Set immediate task completion timer
       session.taskTimer = setTimeout(() => {
-        this.completeTask(sessionId);
+        this.completeTask(sessionId, 'immediate');
       }, this.config.taskCompletionTimeout);
       
-      logger.debug(`Assistant message in session ${sessionId}, task timer set for ${this.config.taskCompletionTimeout}ms`);
+      // Set delayed task completion timer for more confident detection
+      session.delayedTaskTimer = setTimeout(() => {
+        this.completeTask(sessionId, 'delayed');
+      }, this.config.delayedTaskCompletionTimeout);
+      
+      // Start progress monitoring if enabled
+      if (this.config.enableProgressNotifications && !session.progressTimer) {
+        this.startProgressMonitoring(sessionId);
+      }
+      
+      logger.debug(`Assistant message in session ${sessionId}, immediate timer: ${this.config.taskCompletionTimeout}ms, delayed timer: ${this.config.delayedTaskCompletionTimeout}ms`);
     } else if (message.type === 'summary') {
       // Summary message detected - this often indicates task completion
       session.hasSummary = true;
@@ -154,16 +226,126 @@ export class SessionDetector extends EventEmitter {
   }
 
   /**
+   * Start progress monitoring for a task
+   */
+  private startProgressMonitoring(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    
+    // Clear existing progress timer
+    if (session.progressTimer) {
+      clearTimeout(session.progressTimer);
+    }
+    
+    session.progressTimer = setInterval(() => {
+      this.checkTaskProgress(sessionId);
+    }, this.config.progressCheckInterval);
+  }
+  
+  /**
+   * Check task progress and emit notifications if needed
+   */
+  private checkTaskProgress(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session || !session.taskInProgress) {
+      // Stop monitoring if no task in progress
+      if (session?.progressTimer) {
+        clearInterval(session.progressTimer);
+        session.progressTimer = undefined;
+      }
+      return;
+    }
+    
+    const now = Date.now();
+    const taskDuration = session.lastAssistantMessageTime 
+      ? now - (session.currentTaskStartTime?.getTime() || 0)
+      : 0;
+    
+    // Check if task meets progress notification criteria
+    if (taskDuration >= this.config.minProgressDuration && 
+        session.currentTaskCost >= this.config.minProgressCost) {
+      
+      // Don't send too frequent progress notifications
+      const timeSinceLastNotification = session.lastProgressNotificationTime 
+        ? now - session.lastProgressNotificationTime.getTime()
+        : Infinity;
+      
+      if (timeSinceLastNotification >= this.config.progressCheckInterval) {
+        const progressData: TaskProgressData = {
+          sessionId,
+          projectName: session.projectName,
+          currentCost: session.currentTaskCost,
+          currentDuration: taskDuration,
+          assistantMessageCount: session.currentTaskAssistantCount,
+          isActive: true,
+          estimatedCompletion: this.estimateCompletion(session)
+        };
+        
+        logger.debug(`Task progress in session ${sessionId}`, {
+          cost: progressData.currentCost,
+          duration: progressData.currentDuration,
+          messages: progressData.assistantMessageCount
+        });
+        
+        this.emit('task-progress', progressData);
+        session.lastProgressNotificationTime = new Date(now);
+      }
+    }
+  }
+  
+  /**
+   * Estimate task completion time based on recent activity
+   */
+  private estimateCompletion(session: any): number | undefined {
+    if (!session.lastAssistantMessageTime) return undefined;
+    
+    const timeSinceLastMessage = Date.now() - session.lastAssistantMessageTime.getTime();
+    const averageMessageInterval = session.currentTaskAssistantCount > 1 
+      ? (session.lastAssistantMessageTime.getTime() - session.currentTaskStartTime.getTime()) / session.currentTaskAssistantCount
+      : 5000; // Default 5 seconds if only one message
+    
+    // If we're past the average interval, task might be completing soon
+    if (timeSinceLastMessage > averageMessageInterval * 2) {
+      return Math.min(5000, this.config.taskCompletionTimeout - timeSinceLastMessage);
+    }
+    
+    // Otherwise estimate based on pattern
+    return averageMessageInterval * 2;
+  }
+  
+  /**
    * Complete a task and emit task completion event
    */
-  private completeTask(sessionId: string): void {
+  private completeTask(sessionId: string, completionType: 'immediate' | 'delayed' = 'immediate'): void {
     const session = this.sessions.get(sessionId);
     if (!session || session.currentTaskAssistantCount === 0) return;
     
-    // Clear task timer
+    // Clear all task-related timers
     if (session.taskTimer) {
       clearTimeout(session.taskTimer);
       session.taskTimer = undefined;
+    }
+    if (session.delayedTaskTimer) {
+      clearTimeout(session.delayedTaskTimer);
+      session.delayedTaskTimer = undefined;
+    }
+    if (session.progressTimer) {
+      clearInterval(session.progressTimer);
+      session.progressTimer = undefined;
+    }
+    
+    // Check if task meets minimum thresholds
+    if (session.currentTaskCost < this.config.minTaskCost || 
+        session.currentTaskAssistantCount < this.config.minTaskMessages) {
+      logger.debug(`Task in session ${sessionId} below thresholds (cost: ${session.currentTaskCost}, messages: ${session.currentTaskAssistantCount})`);
+      // Still reset task tracking
+      session.currentTaskCost = 0;
+      session.currentTaskAssistantCount = 0;
+      session.currentTaskStartTime = undefined;
+      session.lastAssistantMessageTime = undefined;
+      session.taskInProgress = false;
+      session.lastProgressNotificationTime = undefined;
+      return;
     }
     
     // Calculate task duration
@@ -179,13 +361,15 @@ export class SessionDetector extends EventEmitter {
       taskDuration,
       assistantMessageCount: session.currentTaskAssistantCount,
       lastMessageUuid: session.lastMessageUuid || '',
-      timestamp: session.lastAssistantMessageTime || new Date()
+      timestamp: session.lastAssistantMessageTime || new Date(),
+      completionType
     };
     
-    logger.debug(`Task completed in session ${sessionId}`, {
+    logger.debug(`Task completed in session ${sessionId} (${completionType})`, {
       cost: taskCompletionData.taskCost,
       messages: taskCompletionData.assistantMessageCount,
-      duration: taskCompletionData.taskDuration
+      duration: taskCompletionData.taskDuration,
+      completionType
     });
     
     // Emit task completion event
@@ -196,6 +380,8 @@ export class SessionDetector extends EventEmitter {
     session.currentTaskAssistantCount = 0;
     session.currentTaskStartTime = undefined;
     session.lastAssistantMessageTime = undefined;
+    session.taskInProgress = false;
+    session.lastProgressNotificationTime = undefined;
   }
 
   /**
@@ -214,6 +400,12 @@ export class SessionDetector extends EventEmitter {
     }
     if (session.taskTimer) {
       clearTimeout(session.taskTimer);
+    }
+    if (session.delayedTaskTimer) {
+      clearTimeout(session.delayedTaskTimer);
+    }
+    if (session.progressTimer) {
+      clearInterval(session.progressTimer);
     }
 
     // Calculate session duration
@@ -320,6 +512,27 @@ export class SessionDetector extends EventEmitter {
     }
     if (config.taskCompletionTimeout !== undefined) {
       this.config.taskCompletionTimeout = config.taskCompletionTimeout;
+    }
+    if (config.delayedTaskCompletionTimeout !== undefined) {
+      this.config.delayedTaskCompletionTimeout = config.delayedTaskCompletionTimeout;
+    }
+    if (config.minTaskCost !== undefined) {
+      this.config.minTaskCost = config.minTaskCost;
+    }
+    if (config.minTaskMessages !== undefined) {
+      this.config.minTaskMessages = config.minTaskMessages;
+    }
+    if (config.enableProgressNotifications !== undefined) {
+      this.config.enableProgressNotifications = config.enableProgressNotifications;
+    }
+    if (config.progressCheckInterval !== undefined) {
+      this.config.progressCheckInterval = config.progressCheckInterval;
+    }
+    if (config.minProgressCost !== undefined) {
+      this.config.minProgressCost = config.minProgressCost;
+    }
+    if (config.minProgressDuration !== undefined) {
+      this.config.minProgressDuration = config.minProgressDuration;
     }
   }
 }

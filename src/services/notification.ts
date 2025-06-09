@@ -34,6 +34,8 @@ export interface NotificationConfig {
   soundEnabled?: boolean;
   customIcon?: string;
   customSound?: string; // Custom sound name for macOS
+  taskCompleteSound?: string; // Sound for task completion
+  sessionCompleteSound?: string; // Sound for session completion
   forceDisplay?: boolean; // Force display even in Do Not Disturb mode
   thresholds?: {
     cost?: number;
@@ -82,6 +84,12 @@ export class NotificationService extends EventEmitter {
   async notify(options: NotificationOptions): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
+        logger.debug('Sending notification:', {
+          title: options.title,
+          sound: options.sound,
+          platform: this.platform
+        });
+        
         const notificationOptions: any = {
           title: options.title,
           message: options.message,
@@ -98,7 +106,7 @@ export class NotificationService extends EventEmitter {
           notificationOptions.actions = options.actions;
           notificationOptions.dropdownLabel = options.dropdownLabel;
           // macOS specific settings for better visibility
-          notificationOptions.timeout = 86400; // 24 hours
+          notificationOptions.timeout = options.timeout ?? 86400; // Use provided timeout or 24 hours
           notificationOptions.sender = 'com.apple.Terminal'; // Use Terminal's bundle ID
           notificationOptions.activate = 'com.apple.Terminal'; // Activate Terminal when clicked
           
@@ -108,10 +116,10 @@ export class NotificationService extends EventEmitter {
         } else if (this.platform === 'win32') {
           // Windows-specific options
           notificationOptions.appID = 'Cost Claude';
-          notificationOptions.timeout = 86400; // 24 hours
+          notificationOptions.timeout = options.timeout ?? 86400; // Use provided timeout or 24 hours
         } else {
           // Linux/others
-          notificationOptions.timeout = 86400; // 24 hours
+          notificationOptions.timeout = options.timeout ?? 86400; // Use provided timeout or 24 hours
         }
 
         // Create handlers before adding listeners
@@ -228,19 +236,36 @@ export class NotificationService extends EventEmitter {
     return this.platform === 'darwin' ? 'Terminal' : '';
   }
 
-  private getSound(): string | boolean {
+  private getSound(type?: 'task' | 'session' | 'default'): string | boolean {
     if (!this.soundEnabled) return false;
 
     if (this.platform === 'darwin') {
+      // macOS system sounds - you can choose from:
+      // 'Basso', 'Blow', 'Bottle', 'Frog', 'Funk', 'Glass', 'Hero', 'Morse', 
+      // 'Ping', 'Pop', 'Purr', 'Sosumi', 'Submarine', 'Tink'
+      
+      // Use type-specific sound if specified
+      if (type === 'task' && this.config.taskCompleteSound) {
+        return this.config.taskCompleteSound;
+      }
+      if (type === 'session' && this.config.sessionCompleteSound) {
+        return this.config.sessionCompleteSound;
+      }
+      
       // Use custom sound if specified, otherwise default
       if (this.config.customSound) {
         return this.config.customSound;
       }
       
-      // macOS system sounds - you can choose from:
-      // 'Basso', 'Blow', 'Bottle', 'Frog', 'Funk', 'Glass', 'Hero', 'Morse', 
-      // 'Ping', 'Pop', 'Purr', 'Sosumi', 'Submarine', 'Tink'
-      return 'Ping'; // Default sound
+      // Default sounds for different types
+      switch (type) {
+        case 'task':
+          return 'Pop'; // Quick, light sound for tasks
+        case 'session':
+          return 'Glass'; // More substantial sound for session completion
+        default:
+          return 'Ping'; // Default sound
+      }
     } else if (this.platform === 'win32') {
       // Windows uses boolean for default sound
       return true;
@@ -252,13 +277,20 @@ export class NotificationService extends EventEmitter {
   /**
    * Send a custom notification
    */
-  async sendCustom(title: string, message: string, options?: Partial<NotificationOptions>): Promise<void> {
+  async sendCustom(title: string, message: string, options?: Partial<NotificationOptions> & { soundType?: 'task' | 'session' | 'default' }): Promise<void> {
+    const { soundType, ...notificationOptions } = options || {};
+    
+    // If sound is not explicitly set in options, use type-specific sound
+    const sound = notificationOptions.sound !== undefined 
+      ? notificationOptions.sound 
+      : (this.soundEnabled ? this.getSound(soundType) : false);
+    
     await this.notify({
       title,
       message,
-      sound: this.soundEnabled,
+      sound,
       icon: this.iconPath,
-      ...options,
+      ...notificationOptions,
     });
   }
 

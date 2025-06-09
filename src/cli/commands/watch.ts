@@ -10,25 +10,52 @@ import { JSONLParser } from '../../core/jsonl-parser.js';
 import { logger } from '../../utils/logger.js';
 import { formatCostColored, formatCost, formatDuration, formatNumber, shortenProjectName } from '../../utils/format.js';
 import { ClaudeMessage } from '../../types/index.js';
-import { SessionDetector, SessionCompletionData, TaskCompletionData } from '../../services/session-detector.js';
+import { SessionDetector, SessionCompletionData, TaskCompletionData, TaskProgressData } from '../../services/session-detector.js';
 import { ProjectParser } from '../../core/project-parser.js';
+
+/**
+ * Get the cost of a message, calculating from tokens if costUSD is null
+ */
+function getMessageCost(message: ClaudeMessage, parser: JSONLParser, calculator: CostCalculator): number {
+  // First try to use the pre-calculated costUSD if available and not null
+  if (message.costUSD !== null && message.costUSD !== undefined) {
+    return message.costUSD;
+  }
+  
+  // Fallback: calculate cost from token usage
+  const content = parser.parseMessageContent(message);
+  if (content?.usage) {
+    return calculator.calculate(content.usage);
+  }
+  
+  return 0;
+}
 
 interface WatchOptions {
   path: string;
   notify: boolean;
   minCost: string;
   sound: boolean;
+  sessionSoundOnly: boolean;
   includeExisting: boolean;
   recent?: string;
+  maxAge?: string;
   test?: boolean;
   verbose?: boolean;
   notifyTask: boolean;
   notifySession: boolean;
   notifyCost: boolean;
+  minTaskCost?: string;
+  minTaskMessages?: string;
+  notifyProgress?: boolean;
+  progressInterval?: string;
+  delayedTimeout?: string;
+  taskSound?: string;
+  sessionSound?: string;
   parent?: any; // To access global options like model
 }
 
-async function getRecentMessages(basePath: string, count: number): Promise<ClaudeMessage[]> {
+async function getRecentMessages(basePath: string, count: number, parser: JSONLParser, calculator: CostCalculator): Promise<ClaudeMessage[]> {
   const pattern = `${basePath}/**/*.jsonl`;
   const files = await glob(pattern);
   
@@ -42,8 +69,11 @@ async function getRecentMessages(basePath: string, count: number): Promise<Claud
       for (const line of lines) {
         try {
           const message = JSON.parse(line) as ClaudeMessage;
-          if (message.type === 'assistant' && message.costUSD) {
-            allMessages.push(message);
+          if (message.type === 'assistant') {
+            const cost = getMessageCost(message, parser, calculator);
+            if (cost > 0) {
+              allMessages.push(message);
+            }
           }
         } catch {
           // Skip invalid lines
@@ -74,9 +104,8 @@ export async function watchCommand(options: WatchOptions) {
   const model = options.parent?.opts?.()?.model || 'claude-opus-4-20250514';
   
   // Handle notification options with defaults
-  const notifyTask = options.notify && options.notifyTask;
-  const notifySession = options.notify && options.notifySession;
-  const notifyCost = options.notify && options.notifyCost;
+  const notifySession = options.notify && options.notifySession !== false;
+  const notifyCost = options.notify && options.notifyCost === true;
   
   console.log(chalk.bold.blue('Claude Code Cost Watcher'));
   console.log(chalk.gray('Real-time monitoring for Claude usage'));
@@ -93,10 +122,17 @@ export async function watchCommand(options: WatchOptions) {
   // Show notification settings
   if (options.notify) {
     const notificationTypes = [];
-    if (notifyTask) notificationTypes.push('Task');
     if (notifySession) notificationTypes.push('Session');
     if (notifyCost) notificationTypes.push('Cost');
+    if (options.notifyTask) notificationTypes.push('Task (Delayed)');
+    if (options.notifyProgress !== false) notificationTypes.push('Progress');
     console.log(chalk.gray(`Notifications: ${notificationTypes.join(', ') || 'None'}`));
+    if (options.delayedTimeout) {
+      console.log(chalk.gray(`Delayed completion: ${parseInt(options.delayedTimeout) / 1000}s`));
+    }
+    if (options.progressInterval) {
+      console.log(chalk.gray(`Progress interval: ${parseInt(options.progressInterval) / 1000}s`));
+    }
   }
   
   const recentCount = parseInt(options.recent || '5');
@@ -134,7 +170,9 @@ export async function watchCommand(options: WatchOptions) {
     });
 
     const notificationService = new NotificationService({
-      soundEnabled: options.sound,
+      soundEnabled: options.sound || options.sessionSoundOnly,
+      taskCompleteSound: options.taskSound,
+      sessionCompleteSound: options.sessionSound,
     });
 
     const calculator = new CostCalculator(undefined, model);
@@ -144,14 +182,29 @@ export async function watchCommand(options: WatchOptions) {
     // Initialize session detector
     const sessionDetector = new SessionDetector({
       inactivityTimeout: 300000, // 5 minutes
-      summaryMessageTimeout: 5000 // 5 seconds after summary
+      summaryMessageTimeout: 5000, // 5 seconds after summary
+      taskCompletionTimeout: 3000, // 3 seconds for immediate completion
+      delayedTaskCompletionTimeout: parseInt(options.delayedTimeout || '30000'), // 30 seconds default
+      minTaskCost: parseFloat(options.minTaskCost || '0.01'),
+      minTaskMessages: parseInt(options.minTaskMessages || '1'),
+      enableProgressNotifications: options.notifyProgress !== false,
+      progressCheckInterval: parseInt(options.progressInterval || '10000'), // 10 seconds default
+      minProgressCost: 0.02, // $0.02 minimum for progress
+      minProgressDuration: 15000 // 15 seconds minimum
     });
 
     // Track session costs
     const sessionCosts = new Map<string, number>();
     const sessionMessages = new Map<string, number>();
     let dailyTotal = 0;
-    const today = new Date().toDateString();
+    let currentDay = new Date().toDateString();
+    
+    // Track last summary values to detect changes
+    let lastSummary = {
+      total: 0,
+      sessions: 0,
+      messages: 0
+    };
 
     spinner.succeed('Watcher initialized');
     console.log(chalk.gray(`Watching: ${basePath}`));
@@ -171,26 +224,72 @@ export async function watchCommand(options: WatchOptions) {
     // Set up task completion handler
     sessionDetector.on('task-completed', async (data: TaskCompletionData) => {
       const durationSec = Math.round(data.taskDuration / 1000);
+      const completionIcon = data.completionType === 'delayed' ? '🎯' : '💬';
+      const completionText = data.completionType === 'delayed' ? 'Task Completed (Confident)' : 'Task Completed';
       
       // Console output
-      console.log(chalk.bold.cyan(`\n💬 Task Completed`));
+      console.log(chalk.bold.cyan(`\n${completionIcon} ${completionText}`));
       console.log(chalk.gray(`   Project: ${data.projectName}`));
       console.log(chalk.gray(`   Duration: ${durationSec} seconds`));
       console.log(chalk.gray(`   Cost: ${formatCostColored(data.taskCost)}`));
-      console.log(chalk.gray(`   Messages: ${data.assistantMessageCount}\n`));
+      console.log(chalk.gray(`   Messages: ${data.assistantMessageCount}`));
+      console.log(chalk.gray(`   Type: ${data.completionType}\n`));
       
-      // Send notification if enabled
-      if (notifyTask) {
+      // Send notification for task completions
+      if (options.notifyTask) {
+        const title = data.completionType === 'delayed' 
+          ? `🎯 ${shortenProjectName(data.projectName)} - Task Complete`
+          : `💬 ${shortenProjectName(data.projectName)} - Quick Task`;
+        
         const message = [
-          `⏱️ ${durationSec}s • 💬 ${data.assistantMessageCount} ${data.assistantMessageCount === 1 ? 'response' : 'responses'}`,
+          `⏱️ ${durationSec}s • 💬 ${data.assistantMessageCount} messages`,
           `💰 ${formatCost(data.taskCost)}`
         ].join('\n');
         
         await notificationService.sendCustom(
-          `💬 ${shortenProjectName(data.projectName)} - Task Complete`,
+          title,
           message,
           {
-            sound: options.sound
+            soundType: 'task',
+            timeout: 20, // 20 seconds timeout for task notifications
+            sound: options.sound && !options.sessionSoundOnly // Disable sound if sessionSoundOnly is true
+          }
+        );
+      }
+    });
+    
+    // Set up task progress handler
+    sessionDetector.on('task-progress', async (data: TaskProgressData) => {
+      const durationMin = Math.round(data.currentDuration / 60000);
+      const durationSec = Math.round((data.currentDuration % 60000) / 1000);
+      const timeStr = durationMin > 0 ? `${durationMin}m ${durationSec}s` : `${durationSec}s`;
+      
+      // Console output
+      console.log(chalk.bold.yellow(`\n⏳ Task in Progress`));
+      console.log(chalk.gray(`   Project: ${data.projectName}`));
+      console.log(chalk.gray(`   Duration: ${timeStr}`));
+      console.log(chalk.gray(`   Current Cost: ${formatCostColored(data.currentCost)}`));
+      console.log(chalk.gray(`   Messages: ${data.assistantMessageCount}`));
+      if (data.estimatedCompletion) {
+        const estSec = Math.round(data.estimatedCompletion / 1000);
+        console.log(chalk.gray(`   Est. completion: ~${estSec}s`));
+      }
+      console.log();
+      
+      // Send progress notification if enabled
+      if (options.notifyProgress !== false) {
+        const message = [
+          `⏱️ ${timeStr} • 💬 ${data.assistantMessageCount} messages`,
+          `💰 Current: ${formatCost(data.currentCost)}`,
+          data.estimatedCompletion ? `⏰ Est: ~${Math.round(data.estimatedCompletion / 1000)}s` : ''
+        ].filter(Boolean).join('\n');
+        
+        await notificationService.sendCustom(
+          `⏳ ${shortenProjectName(data.projectName)} - In Progress`,
+          message,
+          {
+            sound: false, // No sound for progress updates
+            timeout: 10 // 10 seconds for progress notifications
           }
         );
       }
@@ -209,8 +308,8 @@ export async function watchCommand(options: WatchOptions) {
       console.log(chalk.gray(`   Messages: ${data.messageCount}`));
       console.log(chalk.gray(`   Avg Cost/Message: ${formatCostColored(avgCostPerMessage)}\n`));
       
-      // Send notification if enabled
-      if (notifySession) {
+      // Send notification if enabled and total cost is not 0
+      if (notifySession && data.totalCost > 0) {
         const message = [
           `📝 ${data.summary}`,
           `⏱️ ${durationMin} min • 💬 ${data.messageCount} messages`,
@@ -221,7 +320,8 @@ export async function watchCommand(options: WatchOptions) {
           `✅ ${shortenProjectName(data.projectName)} - Session Complete`,
           message,
           {
-            sound: options.sound
+            soundType: 'session',
+            sound: options.sound || options.sessionSoundOnly // Enable sound for session if either option is true
           }
         );
       }
@@ -230,27 +330,51 @@ export async function watchCommand(options: WatchOptions) {
 
     // Handle new messages
     watcher.on('new-message', async (message: ClaudeMessage) => {
+      // Filter out old messages to prevent cluttering the display
+      // when messages are written to JSONL with delays
+      const messageAge = Date.now() - new Date(message.timestamp).getTime();
+      const maxAgeMinutes = parseInt(options.maxAge || '5', 10);
+      const maxAge = maxAgeMinutes * 60 * 1000; // Convert to milliseconds
+      
+      if (messageAge > maxAge && !options.includeExisting) {
+        logger.debug(`Skipping old message (${Math.round(messageAge / 1000)}s old):`, {
+          uuid: message.uuid,
+          timestamp: message.timestamp,
+          type: message.type
+        });
+        // Still process through session detector for accurate session tracking
+        sessionDetector.processMessage(message);
+        return;
+      }
+      
       // Process all messages through session detector
       sessionDetector.processMessage(message);
       
+      // Check if we've moved to a new day
+      const todayDate = new Date().toDateString();
+      
       // Reset daily total if it's a new day
-      const messageDate = new Date(message.timestamp).toDateString();
-      if (messageDate !== today) {
+      if (currentDay !== todayDate) {
+        console.log(chalk.bold.blue(`\n📅 New day: ${todayDate}\n`));
         dailyTotal = 0;
+        currentDay = todayDate;
       }
 
       // Only process assistant messages with costs for display
-      if (message.type === 'assistant' && message.costUSD) {
+      if (message.type === 'assistant') {
+        const messageCost = getMessageCost(message, parser, calculator);
+        if (messageCost === 0) return; // Skip messages with no cost
+        
         const sessionId = message.sessionId || 'unknown';
         const currentSessionCost = sessionCosts.get(sessionId) || 0;
         const currentSessionMessages = sessionMessages.get(sessionId) || 0;
         
-        const newSessionCost = currentSessionCost + message.costUSD;
+        const newSessionCost = currentSessionCost + messageCost;
         const newSessionMessages = currentSessionMessages + 1;
         
         sessionCosts.set(sessionId, newSessionCost);
         sessionMessages.set(sessionId, newSessionMessages);
-        dailyTotal += message.costUSD;
+        dailyTotal += messageCost;
 
 
         // Parse message content for token info
@@ -267,24 +391,65 @@ export async function watchCommand(options: WatchOptions) {
         // Extract project name using ProjectParser
         const projectName = ProjectParser.getProjectFromMessage(message) || 'Unknown Project';
 
+        // Remove cost change calculation - not needed
+        // const costChange = messageCost - previousMessageCost;
+        // const costChangeStr = previousMessageCost > 0 
+        //   ? ` (${costChange >= 0 ? '+' : ''}${formatCostColored(costChange)})`
+        //   : '';
+        // previousMessageCost = messageCost;
+
         // Display in console
-        const timestamp = new Date(message.timestamp).toLocaleTimeString();
+        const msgDateTime = new Date(message.timestamp);
+        const dateStr = msgDateTime.toLocaleDateString();
+        const timeStr = msgDateTime.toLocaleTimeString();
+        const isToday = dateStr === new Date().toLocaleDateString();
+        
+        // Show date if not today
+        const timestamp = isToday ? timeStr : `${dateStr} ${timeStr}`;
+        
+        // Update dailyTotal only if message is from today
+        if (msgDateTime.toDateString() === currentDay) {
+          dailyTotal += messageCost;
+        }
+        
+        // Calculate duration: use durationMs if available, otherwise estimate from ttftMs or tokens
+        let duration = message.durationMs || 0;
+        let durationEstimated = false;
+        
+        if (!duration && content?.ttftMs) {
+          // Estimate total duration: ttftMs + time to generate output tokens
+          // Assume ~100 tokens/second generation speed
+          const outputTime = (tokens.output_tokens || 0) * 10; // 10ms per token
+          duration = content.ttftMs + outputTime;
+          durationEstimated = true;
+        } else if (!duration && tokens.output_tokens > 0) {
+          // New format doesn't have ttftMs, estimate based on token count
+          // Assume ~50 tokens/second average speed (including thinking time)
+          duration = Math.max(1000, tokens.output_tokens * 20); // 20ms per token, minimum 1s
+          durationEstimated = true;
+        }
+        
+        // Format duration display with estimation indicator
+        const durationDisplay = durationEstimated 
+          ? `${formatDuration(duration)}~` 
+          : formatDuration(duration);
+        
         console.log(
           `[${chalk.gray(timestamp)}] ` +
-          `Cost: ${formatCostColored(message.costUSD)} | ` +
-          `Duration: ${chalk.cyan(formatDuration(message.durationMs || 0))} | ` +
+          `Cost: ${formatCostColored(messageCost)} | ` +
+          `Duration: ${chalk.cyan(durationDisplay)} | ` +
           `Tokens: ${chalk.gray(formatNumber(tokens.input_tokens + tokens.output_tokens))} | ` +
           `Cache: ${chalk.green(cacheEfficiency.toFixed(0) + '%')} | ` +
           chalk.bold(projectName)
         );
 
         // Send notification if enabled and above threshold
-        if (notifyCost && message.costUSD >= minCost) {
+        if (notifyCost && messageCost >= minCost) {
           await notificationService.notifyCostUpdate({
             sessionId,
             messageId: message.uuid,
-            cost: message.costUSD,
-            duration: message.durationMs || 0,
+            cost: messageCost,
+            duration: duration,
             tokens: {
               input: tokens.input_tokens || 0,
               output: tokens.output_tokens || 0,
@@ -336,13 +501,14 @@ export async function watchCommand(options: WatchOptions) {
     if (recentCount > 0 && !options.includeExisting) {
       const recentSpinner = ora('Loading recent messages...').start();
       try {
-        const recentMessages = await getRecentMessages(basePath, recentCount);
+        const recentMessages = await getRecentMessages(basePath, recentCount, parser, calculator);
         recentSpinner.succeed(`Found ${recentMessages.length} recent messages`);
         
         if (recentMessages.length > 0) {
           console.log(chalk.bold.cyan('\n📜 Recent Messages:'));
           
           // Process each recent message
+          let lastDate = '';
           for (const message of recentMessages.reverse()) {
             // Parse message content for token info
             const content = parser.parseMessageContent(message);
@@ -354,15 +520,47 @@ export async function watchCommand(options: WatchOptions) {
             };
             
             const cacheEfficiency = calculator.calculateCacheEfficiency(tokens);
-            const timestamp = new Date(message.timestamp).toLocaleTimeString();
+            const messageDate = new Date(message.timestamp);
+            const dateStr = messageDate.toLocaleDateString();
+            const timeStr = messageDate.toLocaleTimeString();
+            
+            // Show date header when date changes
+            if (dateStr !== lastDate) {
+              console.log(chalk.bold.gray(`\n📅 ${dateStr}`));
+              lastDate = dateStr;
+            }
             
             // Extract project name using ProjectParser
             const projectName = ProjectParser.getProjectFromMessage(message) || 'Unknown Project';
             
+            const messageCost = getMessageCost(message, parser, calculator);
+            
+            // Calculate duration: use durationMs if available, otherwise estimate from ttftMs or tokens
+            let duration = message.durationMs || 0;
+            let durationEstimated = false;
+            
+            if (!duration && content?.ttftMs) {
+              // Estimate total duration: ttftMs + time to generate output tokens
+              // Assume ~100 tokens/second generation speed
+              const outputTime = (tokens.output_tokens || 0) * 10; // 10ms per token
+              duration = content.ttftMs + outputTime;
+              durationEstimated = true;
+            } else if (!duration && tokens.output_tokens > 0) {
+              // New format doesn't have ttftMs, estimate based on token count
+              // Assume ~50 tokens/second average speed (including thinking time)
+              duration = Math.max(1000, tokens.output_tokens * 20); // 20ms per token, minimum 1s
+              durationEstimated = true;
+            }
+            
+            // Format duration display with estimation indicator
+            const durationDisplay = durationEstimated 
+              ? `${formatDuration(duration)}~` 
+              : formatDuration(duration);
+            
             console.log(
-              `[${chalk.gray(timestamp)}] ` +
-              `Cost: ${formatCostColored(message.costUSD || 0)} | ` +
-              `Duration: ${chalk.cyan(formatDuration(message.durationMs || 0))} | ` +
+              `[${chalk.gray(timeStr)}] ` +
+              `Cost: ${formatCostColored(messageCost)} | ` +
+              `Duration: ${chalk.cyan(durationDisplay)} | ` +
               `Tokens: ${chalk.gray(formatNumber(tokens.input_tokens + tokens.output_tokens))} | ` +
               `Cache: ${chalk.green(cacheEfficiency.toFixed(0) + '%')} | ` +
               chalk.bold(projectName)
@@ -372,13 +570,13 @@ export async function watchCommand(options: WatchOptions) {
             const sessionId = message.sessionId || 'unknown';
             const currentSessionCost = sessionCosts.get(sessionId) || 0;
             const currentSessionMessages = sessionMessages.get(sessionId) || 0;
-            sessionCosts.set(sessionId, currentSessionCost + (message.costUSD || 0));
+            sessionCosts.set(sessionId, currentSessionCost + messageCost);
             sessionMessages.set(sessionId, currentSessionMessages + 1);
             
-            // Update daily total
-            const messageDate = new Date(message.timestamp).toDateString();
-            if (messageDate === today) {
-              dailyTotal += message.costUSD || 0;
+            // Update daily total only if message is from current day
+            const messageDateStr = new Date(message.timestamp).toDateString();
+            if (messageDateStr === currentDay) {
+              dailyTotal += messageCost;
             }
           }
           
@@ -453,13 +651,28 @@ export async function watchCommand(options: WatchOptions) {
 
     // Show daily summary every hour
     const summaryInterval = setInterval(() => {
-      if (dailyTotal > 0) {
+      const currentMessages = Array.from(sessionMessages.values()).reduce((a, b) => a + b, 0);
+      const currentSessions = sessionCosts.size;
+      
+      // Only show summary if there are changes or if there's activity
+      const hasChanges = dailyTotal !== lastSummary.total || 
+                        currentSessions !== lastSummary.sessions || 
+                        currentMessages !== lastSummary.messages;
+      
+      if (dailyTotal > 0 && hasChanges) {
         console.log(
           chalk.bold.yellow('\n📊 Hourly Summary:') +
           `\n  Today's total: ${formatCostColored(dailyTotal)}` +
-          `\n  Active sessions: ${sessionCosts.size}` +
-          `\n  Total messages: ${Array.from(sessionMessages.values()).reduce((a, b) => a + b, 0)}\n`
+          `\n  Active sessions: ${currentSessions}` +
+          `\n  Total messages: ${currentMessages}\n`
         );
+        
+        // Update last summary values
+        lastSummary = {
+          total: dailyTotal,
+          sessions: currentSessions,
+          messages: currentMessages
+        };
       }
     }, 3600000); // 1 hour
 

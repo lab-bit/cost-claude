@@ -121,7 +121,7 @@ export class GroupAnalyzer {
   /**
    * Group by session (existing functionality)
    */
-  groupBySession(messages: ClaudeMessage[]): GroupedStats[] {
+  groupBySession(messages: ClaudeMessage[], filterLastWeek: boolean = false): GroupedStats[] {
     const grouped = this.parser.groupBySession(messages);
     const results: GroupedStats[] = [];
 
@@ -161,6 +161,20 @@ export class GroupAnalyzer {
             }
           }
         }
+        
+        // Filter by last week if requested
+        if (filterLastWeek && stats.endTime) {
+          const endDate = new Date(stats.endTime);
+          const oneWeekAgo = new Date();
+          oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+          oneWeekAgo.setHours(0, 0, 0, 0);
+          
+          // Skip sessions that ended more than a week ago
+          if (endDate < oneWeekAgo) {
+            return;
+          }
+        }
+        
         results.push(stats);
       }
     });
@@ -189,8 +203,15 @@ export class GroupAnalyzer {
     let cacheReadCost = 0;
 
     assistantMessages.forEach(msg => {
-      if (msg.costUSD) {
+      // First try to use the pre-calculated costUSD if available and not null
+      if (msg.costUSD !== null && msg.costUSD !== undefined) {
         totalCost += msg.costUSD;
+      } else {
+        // Fallback: calculate cost from token usage
+        const content = this.parser.parseMessageContent(msg);
+        if (content?.usage) {
+          totalCost += this.calculator.calculate(content.usage);
+        }
       }
 
       if (msg.durationMs) {
@@ -293,10 +314,25 @@ export class GroupAnalyzer {
     ranges.forEach(range => grouped.set(range.name, []));
 
     messages.forEach(msg => {
-      if (msg.type === 'assistant' && msg.costUSD) {
-        const range = ranges.find(r => msg.costUSD! >= r.min && msg.costUSD! < r.max);
-        if (range) {
-          grouped.get(range.name)!.push(msg);
+      if (msg.type === 'assistant') {
+        let msgCost = 0;
+        
+        // First try to use the pre-calculated costUSD if available and not null
+        if (msg.costUSD !== null && msg.costUSD !== undefined) {
+          msgCost = msg.costUSD;
+        } else {
+          // Fallback: calculate cost from token usage
+          const content = this.parser.parseMessageContent(msg);
+          if (content?.usage) {
+            msgCost = this.calculator.calculate(content.usage);
+          }
+        }
+        
+        if (msgCost > 0) {
+          const range = ranges.find(r => msgCost >= r.min && msgCost < r.max);
+          if (range) {
+            grouped.get(range.name)!.push(msg);
+          }
         }
       }
     });

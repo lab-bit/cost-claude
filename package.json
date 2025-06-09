@@ -1,6 +1,6 @@
 {
   "name": "cost-claude",
-  "version": "0.1.1",
+  "version": "0.1.5",
   "description": "Claude Code cost monitoring, analytics, and optimization toolkit",
   "main": "dist/cli/index.js",
   "type": "module",
@@ -23,7 +23,8 @@
     "test:watcher": "tsx src/test-watcher.ts",
     "test:notification": "tsx scripts/test-notification.ts",
     "test:session": "tsx scripts/test-session-detector.ts",
-    "test:mac-notification": "tsx scripts/test-mac-notification.ts"
+    "test:mac-notification": "tsx scripts/test-mac-notification.ts",
+    "test:task-completion": "tsx scripts/test-task-completion.ts"
   },
   "keywords": [
     "claude",
@@ -36,13 +37,13 @@
   ],
   "author": "Lab Bit",
   "license": "MIT",
-  "homepage": "https://github.com/lab-bit/claude-code-cost-checker#readme",
+  "homepage": "https://github.com/lab-bit/cost-claude#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lab-bit/claude-code-cost-checker.git"
+    "url": "git+https://github.com/lab-bit/cost-claude.git"
   },
   "bugs": {
-    "url": "https://github.com/lab-bit/claude-code-cost-checker/issues"
+    "url": "https://github.com/lab-bit/cost-claude/issues"
   },
   "bin": {
     "cost-claude": "./dist/cli/index.js"

@@ -19,6 +19,24 @@ import { ExportService } from '../../services/export-service.js';
 import { CostPredictor } from '../../services/cost-predictor.js';
 import { UsageInsightsAnalyzer } from '../../services/usage-insights.js';
 
+/**
+ * Get the cost of a message, calculating from tokens if costUSD is null
+ */
+function getMessageCost(message: ClaudeMessage, parser: JSONLParser, calculator: CostCalculator): number {
+  // First try to use the pre-calculated costUSD if available and not null
+  if (message.costUSD !== null && message.costUSD !== undefined) {
+    return message.costUSD;
+  }
+  
+  // Fallback: calculate cost from token usage
+  const content = parser.parseMessageContent(message);
+  if (content?.usage) {
+    return calculator.calculate(content.usage);
+  }
+  
+  return 0;
+}
+
 interface AnalyzeOptions {
   path: string;
   from?: string;
@@ -27,10 +45,12 @@ interface AnalyzeOptions {
   format: 'table' | 'json' | 'csv' | 'html';
   export?: string;
   groupBy?: 'session' | 'project' | 'date' | 'hour';
-  showAll?: boolean;
   detailed?: boolean;
   top?: string;
   live?: boolean;
+  simple?: boolean;
+  daily?: boolean;
+  insights?: boolean;
   parent?: any; // To access global options like model
 }
 
@@ -111,7 +131,10 @@ export async function analyzeCommand(options: AnalyzeOptions) {
       let currentDay = '';
       
       for (const message of sortedMessages) {
-        if (message.type !== 'assistant' || !message.costUSD) continue;
+        if (message.type !== 'assistant') continue;
+        
+        const messageCost = getMessageCost(message, parser, calculator);
+        if (messageCost === 0) continue;
         
         const messageDate = new Date(message.timestamp).toDateString();
         if (messageDate !== currentDay) {
@@ -142,10 +165,19 @@ export async function analyzeCommand(options: AnalyzeOptions) {
           projectName = pathParts[pathParts.length - 1] || pathParts[pathParts.length - 2] || 'Unknown';
         }
         
+        // Calculate duration: use durationMs if available, otherwise estimate from ttftMs
+        let duration = message.durationMs || 0;
+        if (!duration && content?.ttftMs) {
+          // Estimate total duration: ttftMs + time to generate output tokens
+          // Assume ~100 tokens/second generation speed
+          const outputTime = (tokens.output_tokens || 0) * 10; // 10ms per token
+          duration = content.ttftMs + outputTime;
+        }
+        
         console.log(
           `[${chalk.gray(timestamp)}] ` +
-          `Cost: ${formatCostColored(message.costUSD)} | ` +
-          `Duration: ${chalk.cyan(formatDuration(message.durationMs || 0))} | ` +
+          `Cost: ${formatCostColored(messageCost)} | ` +
+          `Duration: ${chalk.cyan(formatDuration(duration))} | ` +
           `Tokens: ${chalk.gray(formatNumber(tokens.input_tokens + tokens.output_tokens))} | ` +
           `Cache: ${chalk.green(cacheEfficiency.toFixed(0) + '%')} | ` +
           chalk.bold(projectName)
@@ -155,17 +187,17 @@ export async function analyzeCommand(options: AnalyzeOptions) {
         const sessionId = message.sessionId || 'unknown';
         const currentSessionCost = sessionCosts.get(sessionId) || 0;
         const currentSessionMessages = sessionMessages.get(sessionId) || 0;
-        sessionCosts.set(sessionId, currentSessionCost + message.costUSD);
+        sessionCosts.set(sessionId, currentSessionCost + messageCost);
         sessionMessages.set(sessionId, currentSessionMessages + 1);
-        dailyTotal += message.costUSD;
+        dailyTotal += messageCost;
         
         // Show session summary every 10 messages
         if ((currentSessionMessages + 1) % 10 === 0) {
           console.log(
             chalk.dim('  └─ Session summary: ') +
             `${currentSessionMessages + 1} messages | ` +
-            `Total: ${formatCostColored(currentSessionCost + message.costUSD)} | ` +
-            `Avg: ${formatCostColored((currentSessionCost + message.costUSD) / (currentSessionMessages + 1))}`
+            `Total: ${formatCostColored(currentSessionCost + messageCost)} | ` +
+            `Avg: ${formatCostColored((currentSessionCost + messageCost) / (currentSessionMessages + 1))}`
           );
         }
       }
@@ -185,7 +217,7 @@ export async function analyzeCommand(options: AnalyzeOptions) {
     }
 
     // Calculate statistics
-    const stats = calculateStats(allMessages, parser, calculator, options);
+    const stats = await calculateStats(allMessages, parser, calculator, options);
     stats.model = model;
 
     spinner.succeed(`Analysis complete: ${stats.totalMessages} messages processed`);
@@ -200,7 +232,7 @@ export async function analyzeCommand(options: AnalyzeOptions) {
         break;
       case 'table':
       default:
-        displayTable(stats, options, calculator);
+        await displayTable(stats, options, calculator);
         break;
     }
 
@@ -217,7 +249,7 @@ export async function analyzeCommand(options: AnalyzeOptions) {
   }
 }
 
-function calculateStats(
+async function calculateStats(
   messages: ClaudeMessage[],
   parser: JSONLParser,
   calculator: CostCalculator,
@@ -226,6 +258,7 @@ function calculateStats(
   const assistantMessages = parser.filterByType(messages, 'assistant');
   const userMessages = parser.filterByType(messages, 'user');
   
+  // Initialize all analyzers
   const groupAnalyzer = new GroupAnalyzer(parser, calculator);
 
   let totalCost = 0;
@@ -245,9 +278,8 @@ function calculateStats(
 
   // Process all assistant messages
   assistantMessages.forEach((msg) => {
-    if (msg.costUSD) {
-      totalCost += msg.costUSD;
-    }
+    const msgCost = getMessageCost(msg, parser, calculator);
+    totalCost += msgCost;
 
     if (msg.durationMs) {
       totalDuration += msg.durationMs;
@@ -287,30 +319,149 @@ function calculateStats(
     cache_creation_input_tokens: totalCacheCreationTokens,
   });
 
-  // Get grouped statistics
+  // Get all grouped statistics (always show all by default)
   const groupedStats: any = {};
-  
-  if (options.showAll) {
-    groupedStats.bySession = groupAnalyzer.groupBySession(messages);
-    groupedStats.byProject = groupAnalyzer.groupByProject(messages);
-    groupedStats.byDate = groupAnalyzer.groupByDate(messages);
-    groupedStats.byHour = groupAnalyzer.groupByHour(messages);
-  } else {
-    switch (options.groupBy) {
-      case 'project':
-        groupedStats.byProject = groupAnalyzer.groupByProject(messages);
-        break;
-      case 'date':
-        groupedStats.byDate = groupAnalyzer.groupByDate(messages);
-        break;
-      case 'hour':
-        groupedStats.byHour = groupAnalyzer.groupByHour(messages);
-        break;
-      case 'session':
-      default:
-        groupedStats.bySession = groupAnalyzer.groupBySession(messages);
-        break;
+  groupedStats.bySession = groupAnalyzer.groupBySession(messages, true); // Filter last week for sessions
+  groupedStats.byProject = groupAnalyzer.groupByProject(messages);
+  groupedStats.byDate = groupAnalyzer.groupByDate(messages);
+  groupedStats.byHour = groupAnalyzer.groupByHour(messages);
+
+  // Session analysis removed - not needed
+
+  // Daily analysis (if not disabled)
+  let dailyStats = null;
+  if (options.daily !== false) {
+    try {
+      // Get daily patterns analysis for all messages
+      const dailyPatterns = {
+        busiestDay: { date: 'N/A', cost: 0, messages: 0 },
+        mostExpensiveDay: { date: 'N/A', cost: 0 },
+        averageDailyCost: 0,
+        averageDailyMessages: 0,
+        weekdayVsWeekend: null as any,
+        hourlyDistribution: [] as any[],
+        dailyTrend: [] as any[],
+        mostProductiveHour: null as any,
+        leastProductiveHour: null as any,
+        totalDays: 0,
+        daysWithActivity: 0
+      };
+      
+      // Group messages by date
+      const dateGroups = new Map<string, ClaudeMessage[]>();
+      messages.forEach(msg => {
+        try {
+          const date = new Date(msg.timestamp).toISOString().split('T')[0];
+          if (date && !dateGroups.has(date)) {
+            dateGroups.set(date, []);
+          }
+          if (date) {
+            dateGroups.get(date)!.push(msg);
+          }
+        } catch {
+          // Skip invalid timestamps
+        }
+      });
+      
+      // Analyze daily patterns
+      let totalDailyCost = 0;
+      let totalDailyMessages = 0;
+      let weekdayCost = 0;
+      let weekdayCount = 0;
+      let weekendCost = 0;
+      let weekendCount = 0;
+      
+      // Hourly distribution map
+      const hourlyMap = new Map<number, { cost: number; messages: number }>();
+      
+      dateGroups.forEach((msgs, date) => {
+        // Calculate day cost using the same logic as elsewhere
+        const dayCost = msgs.reduce((sum, m) => {
+          if (m.type !== 'assistant') return sum;
+          return sum + getMessageCost(m, parser, calculator);
+        }, 0);
+        const dayOfWeek = new Date(date).getDay();
+        
+        totalDailyCost += dayCost;
+        totalDailyMessages += msgs.length;
+        
+        if (dayOfWeek === 0 || dayOfWeek === 6) {
+          weekendCost += dayCost;
+          weekendCount++;
+        } else {
+          weekdayCost += dayCost;
+          weekdayCount++;
+        }
+        
+        if (msgs.length > dailyPatterns.busiestDay.messages) {
+          dailyPatterns.busiestDay = { date, cost: dayCost, messages: msgs.length };
+        }
+        if (dayCost > dailyPatterns.mostExpensiveDay.cost) {
+          dailyPatterns.mostExpensiveDay = { date, cost: dayCost };
+        }
+        
+        // Store daily trend (last 7 days)
+        dailyPatterns.dailyTrend.push({ date, cost: dayCost, messages: msgs.length });
+        
+        // Calculate hourly distribution
+        msgs.forEach(msg => {
+          try {
+            const hour = new Date(msg.timestamp).getHours();
+            const current = hourlyMap.get(hour) || { cost: 0, messages: 0 };
+            current.messages++;
+            if (msg.type === 'assistant') {
+              current.cost += getMessageCost(msg, parser, calculator);
+            }
+            hourlyMap.set(hour, current);
+          } catch {}
+        });
+      });
+      
+      dailyPatterns.averageDailyCost = dateGroups.size > 0 ? totalDailyCost / dateGroups.size : 0;
+      dailyPatterns.averageDailyMessages = dateGroups.size > 0 ? totalDailyMessages / dateGroups.size : 0;
+      
+      if (weekdayCount > 0 || weekendCount > 0) {
+        dailyPatterns.weekdayVsWeekend = {
+          weekdayAvg: weekdayCount > 0 ? weekdayCost / weekdayCount : 0,
+          weekendAvg: weekendCount > 0 ? weekendCost / weekendCount : 0,
+          weekdayTotal: weekdayCost,
+          weekendTotal: weekendCost,
+          weekdayDays: weekdayCount,
+          weekendDays: weekendCount
+        };
+      }
+      
+      // Process hourly distribution
+      const hourlyArray = Array.from(hourlyMap.entries())
+        .map(([hour, data]) => ({ hour, ...data }))
+        .sort((a, b) => b.cost - a.cost);
+      
+      dailyPatterns.hourlyDistribution = hourlyArray;
+      if (hourlyArray.length > 0) {
+        dailyPatterns.mostProductiveHour = hourlyArray[0];
+        dailyPatterns.leastProductiveHour = hourlyArray[hourlyArray.length - 1];
+      }
+      
+      // Sort daily trend by date (keep last 7 days)
+      dailyPatterns.dailyTrend = dailyPatterns.dailyTrend
+        .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+        .slice(0, 7);
+      
+      dailyPatterns.totalDays = dateGroups.size;
+      dailyPatterns.daysWithActivity = Array.from(dateGroups.values()).filter(msgs => msgs.length > 0).length;
+      
+      dailyStats = dailyPatterns;
+    } catch (error) {
+      console.error('Error analyzing daily patterns:', error);
+      dailyStats = null;
     }
+  }
+
+  // Insights analysis (if not disabled)
+  let insights = null;
+  if (options.insights !== false) {
+    const insightsAnalyzer = new UsageInsightsAnalyzer();
+    insights = await insightsAnalyzer.analyzeUsage(messages);
   }
 
   return {
@@ -330,25 +481,39 @@ function calculateStats(
     cacheSavings,
     costBreakdown,
     ...groupedStats,
+    dailyStats,
+    insights,
   };
 }
 
-function displayTable(stats: any, options: AnalyzeOptions, calculator: CostCalculator) {
-  console.log('\n' + chalk.bold.blue('Claude Code Usage Analysis'));
-  console.log(chalk.dim(`Model: ${stats.model || 'claude-opus-4-20250514'}`));
-  console.log(createSeparator(50));
+async function displayTable(stats: any, options: AnalyzeOptions, calculator: CostCalculator) {
+  // Simple mode - just show overview
+  if (options.simple) {
+    displaySimpleOverview(stats, calculator);
+    return;
+  }
 
-  // Overview
-  console.log(chalk.bold('\nOverview:'));
+  // Full analysis mode - show everything by default
+  console.log('\n' + chalk.bold.blue('='.repeat(60)));
+  console.log(chalk.bold.blue('🤖 Claude Code Complete Analysis Report'));
+  console.log(chalk.dim(`Analysis Period: ${new Date().toLocaleDateString()}`));
+  console.log(chalk.dim(`Model: ${stats.model || 'claude-opus-4-20250514'}`));
+  console.log(chalk.bold.blue('='.repeat(60)));
+
+  // 📦 1. OVERVIEW SECTION
+  console.log(chalk.bold.cyan('\n📦 Overview'));
+  console.log(chalk.dim('-'.repeat(40)));
   console.log(`  Total Messages: ${chalk.cyan(formatNumber(stats.totalMessages))}`);
   console.log(`  User Messages:  ${chalk.cyan(formatNumber(stats.userMessages))}`);
   console.log(`  AI Responses:   ${chalk.cyan(formatNumber(stats.assistantMessages))}`);
   console.log(`  Sessions:       ${chalk.cyan(stats.totalSessions)}`);
 
-  // Costs
-  console.log(chalk.bold('\nCosts Summary:'));
+  // 💵 2. COSTS SECTION
+  console.log(chalk.bold.green('\n💵 Costs Summary'));
+  console.log(chalk.dim('-'.repeat(40)));
   console.log(`  Total Cost:     ${formatCostColored(stats.totalCost)}`);
   console.log(`  Avg per Msg:    ${formatCostColored(stats.averageCostPerMessage)}`);
+  console.log(`  Avg per Session:${formatCostColored(stats.totalSessions > 0 ? stats.totalCost / stats.totalSessions : 0)}`);
   
   // Cache Savings with explanation
   const savingsDisplay = stats.cacheSavings >= 0 
@@ -373,8 +538,9 @@ function displayTable(stats: any, options: AnalyzeOptions, calculator: CostCalcu
   console.log(`  Cache Creation:  ${formatCostColored(stats.costBreakdown.cacheCreationCost)} (${formatNumber(stats.totalCacheCreationTokens)} tokens)`);
   console.log(`  Cache Read:      ${formatCostColored(stats.costBreakdown.cacheReadCost)} (${formatNumber(stats.totalCacheTokens)} tokens)`);
 
-  // Performance
-  console.log(chalk.bold('\nPerformance:'));
+  // 🎯 3. PERFORMANCE SECTION  
+  console.log(chalk.bold.yellow('\n🎯 Performance'));
+  console.log(chalk.dim('-'.repeat(40)));
   console.log(`  Total Duration: ${chalk.cyan(formatDuration(stats.totalDuration))}`);
   console.log(`  Avg per Msg:    ${chalk.cyan(formatDuration(stats.averageDurationPerMessage))}`);
   console.log(`  Cache Hit Rate: ${formatPercentage(stats.cacheEfficiency)} ${stats.cacheEfficiency > 50 ? chalk.green('✓') : stats.cacheEfficiency > 0 ? chalk.yellow('⚡') : chalk.gray('○')}`);
@@ -384,8 +550,9 @@ function displayTable(stats: any, options: AnalyzeOptions, calculator: CostCalcu
     console.log(chalk.dim(`                  ${chalk.green('Excellent!')} Cache is working efficiently`));
   }
 
-  // Token Usage Summary
-  console.log(chalk.bold('\nToken Usage Summary:'));
+  // 🔢 4. TOKEN USAGE SECTION
+  console.log(chalk.bold.magenta('\n🔢 Token Usage'));
+  console.log(chalk.dim('-'.repeat(40)));
   console.log(`  Total Input:     ${chalk.cyan(formatNumber(stats.totalInputTokens + stats.totalCacheTokens + stats.totalCacheCreationTokens))}`);
   console.log(`    Regular Input: ${chalk.cyan(formatNumber(stats.totalInputTokens))}`);
   console.log(`    Cache Write:   ${chalk.cyan(formatNumber(stats.totalCacheCreationTokens))}`);
@@ -395,28 +562,152 @@ function displayTable(stats: any, options: AnalyzeOptions, calculator: CostCalcu
   // Parse top count
   const topCount = parseInt(options.top || '5', 10);
   
-  // Display grouped statistics
-  if (options.showAll) {
-    // Show all groupings
-    displayGroupedStats('Sessions', stats.bySession, 'session', options.detailed, topCount);
-    displayGroupedStats('Projects', stats.byProject, 'project', options.detailed, topCount);
-    displayGroupedStats('Daily', stats.byDate, 'date', options.detailed, topCount);
-    displayGroupedStats('Hourly', stats.byHour, 'hour', options.detailed, topCount * 2); // Show more hours
-  } else {
-    // Show selected grouping
-    if (stats.bySession) {
-      displayGroupedStats('Sessions', stats.bySession, 'session', options.detailed, topCount);
+  // 📈 5. GROUPED STATISTICS SECTION
+  console.log(chalk.bold.blue('\n📈 Grouped Statistics'));
+  console.log(chalk.dim('='.repeat(60)));
+  
+  // Always show all groupings by default (unless in simple mode)
+  if (stats.bySession) {
+    displayGroupedStats('Top Sessions (Last Week)', stats.bySession, 'session', options.detailed, topCount);
+  }
+  if (stats.byProject) {
+    displayGroupedStats('Top Projects', stats.byProject, 'project', options.detailed, topCount);
+  }
+  if (stats.byDate) {
+    displayGroupedStats('Daily Breakdown', stats.byDate, 'date', options.detailed, topCount);
+  }
+  if (stats.byHour) {
+    displayGroupedStats('Hourly Pattern', stats.byHour, 'hour', options.detailed, topCount * 2);
+  }
+
+  // 📅 6. DAILY PATTERNS SECTION (if available)
+  if (stats.dailyStats && options.daily !== false) {
+    console.log(chalk.bold.green('\n📅 Daily Usage Patterns'));
+    console.log(chalk.dim('='.repeat(60)));
+    
+    const daily = stats.dailyStats;
+    
+    // Use byDate data for more accurate information
+    const dailyData = stats.byDate || [];
+    const totalDailyCost = dailyData.reduce((sum: number, day: any) => sum + day.totalCost, 0);
+    const avgDailyCost = dailyData.length > 0 ? totalDailyCost / dailyData.length : 0;
+    const avgDailyMessages = dailyData.length > 0 ? dailyData.reduce((sum: number, day: any) => sum + day.messageCount, 0) / dailyData.length : 0;
+    
+    // Summary statistics
+    console.log(chalk.yellow('\n  Summary:'));
+    console.log(`    Active Days: ${chalk.cyan(dailyData.length)} days`);
+    console.log(`    Average Daily Cost: ${formatCostColored(avgDailyCost)}`);
+    console.log(`    Average Daily Messages: ${chalk.cyan(avgDailyMessages.toFixed(0))}`);
+    
+    // Record days
+    console.log(chalk.yellow('\n  Record Days:'));
+    if (dailyData.length > 0) {
+      const sortedByCost = [...dailyData].sort((a: any, b: any) => b.totalCost - a.totalCost);
+      const sortedByMessages = [...dailyData].sort((a: any, b: any) => b.messageCount - a.messageCount);
+      console.log(`    Busiest: ${chalk.cyan(sortedByMessages[0].groupName)} (${sortedByMessages[0].messageCount} messages, ${formatCostColored(sortedByMessages[0].totalCost)})`);
+      console.log(`    Most Expensive: ${chalk.cyan(sortedByCost[0].groupName)} (${formatCostColored(sortedByCost[0].totalCost)})`);
     }
-    if (stats.byProject) {
-      displayGroupedStats('Projects', stats.byProject, 'project', options.detailed, topCount);
+    
+    // Weekday vs Weekend
+    if (daily.weekdayVsWeekend) {
+      const wd = daily.weekdayVsWeekend;
+      console.log(chalk.yellow('\n  Weekday vs Weekend:'));
+      console.log(`    Weekdays (${wd.weekdayDays} days):`);
+      console.log(`      Total: ${formatCostColored(wd.weekdayTotal)}`);
+      console.log(`      Average: ${formatCostColored(wd.weekdayAvg)}/day`);
+      console.log(`    Weekends (${wd.weekendDays} days):`);
+      console.log(`      Total: ${formatCostColored(wd.weekendTotal)}`);
+      console.log(`      Average: ${formatCostColored(wd.weekendAvg)}/day`);
+      
+      // Productivity comparison
+      const moreProductiveOn = wd.weekdayAvg > wd.weekendAvg ? 'weekdays' : 'weekends';
+      const productivityDiff = Math.abs(wd.weekdayAvg - wd.weekendAvg);
+      console.log(chalk.dim(`      👉 You're ${formatPercentage((productivityDiff / Math.min(wd.weekdayAvg, wd.weekendAvg)) * 100)} more active on ${moreProductiveOn}`));
     }
-    if (stats.byDate) {
-      displayGroupedStats('Daily', stats.byDate, 'date', options.detailed, topCount);
+    
+    // Peak hours
+    if (daily.hourlyDistribution && daily.hourlyDistribution.length > 0) {
+      console.log(chalk.yellow('\n  Hourly Activity Pattern:'));
+      console.log(`    Most Active Hour: ${chalk.cyan(daily.mostProductiveHour.hour + ':00')} (${formatCostColored(daily.mostProductiveHour.cost)}, ${daily.mostProductiveHour.messages} msgs)`);
+      console.log(`    Least Active Hour: ${chalk.cyan(daily.leastProductiveHour.hour + ':00')} (${formatCostColored(daily.leastProductiveHour.cost)}, ${daily.leastProductiveHour.messages} msgs)`);
+      
+      console.log(chalk.dim('\n    Top 5 Active Hours:'));
+      daily.hourlyDistribution.slice(0, 5).forEach((hour: any) => {
+        const barLength = Math.round((hour.cost / daily.hourlyDistribution[0].cost) * 20);
+        const bar = '█'.repeat(barLength) + '░'.repeat(20 - barLength);
+        console.log(chalk.dim(`    ${String(hour.hour).padStart(2, '0')}:00 ${bar} ${formatCostColored(hour.cost)}`));
+      });
     }
-    if (stats.byHour) {
-      displayGroupedStats('Hourly', stats.byHour, 'hour', options.detailed, topCount * 2);
+    
+    // Recent trend (last 7 days)
+    if (daily.dailyTrend && daily.dailyTrend.length > 0) {
+      console.log(chalk.yellow('\n  Last 7 Days Trend:'));
+      daily.dailyTrend.forEach((day: any) => {
+        const dayName = new Date(day.date).toLocaleDateString('en-US', { weekday: 'short' });
+        const barLength = Math.round((day.cost / daily.mostExpensiveDay.cost) * 20);
+        const bar = '█'.repeat(barLength) + '░'.repeat(20 - barLength);
+        console.log(`    ${day.date} (${dayName}) ${bar} ${formatCostColored(day.cost)}`);
+      });
     }
   }
+
+  // 💡 8. INSIGHTS SECTION (if available)
+  if (stats.insights && options.insights !== false) {
+    console.log(chalk.bold.yellow('\n💡 Usage Insights & Recommendations'));
+    console.log(chalk.dim('='.repeat(60)));
+    
+    const insights = stats.insights.insights || [];
+    const recommendations = stats.insights.recommendations || [];
+    
+    if (insights.length > 0) {
+      console.log(chalk.cyan('\n  Key Insights:'));
+      insights.forEach((insight: any) => {
+        const icon = insight.severity === 'critical' ? '🔴' : 
+                    insight.severity === 'warning' ? '🟡' : 
+                    insight.severity === 'info' ? '🔵' : '🟢';
+        console.log(`    ${icon} ${insight.message}`);
+      });
+    }
+    
+    if (recommendations.length > 0) {
+      console.log(chalk.green('\n  Recommendations:'));
+      recommendations.forEach((rec: any) => {
+        console.log(`    👉 ${rec.message}`);
+        if (rec.potentialSavings) {
+          console.log(chalk.dim(`       Potential savings: ${formatCostColored(rec.potentialSavings)}`));
+        }
+      });
+    }
+    
+    // Summary metrics
+    if (stats.insights.summary) {
+      const summary = stats.insights.summary;
+      console.log(chalk.yellow('\n  Usage Summary:'));
+      console.log(`    Avg tokens/message: ${chalk.cyan(summary.avgTokensPerMessage.toFixed(0))}`);
+      console.log(`    Input/Output ratio: ${chalk.cyan(summary.inputOutputRatio.toFixed(2))}`);
+      console.log(`    Cache efficiency: ${chalk.green(summary.cacheEfficiency.toFixed(0) + '%')}`);
+      if (summary.estimatedMonthlyCost) {
+        console.log(`    Projected monthly: ${formatCostColored(summary.estimatedMonthlyCost)}`);
+      }
+    }
+  }
+
+  // Footer
+  console.log(chalk.dim('\n' + '='.repeat(60)));
+  console.log(chalk.dim('Analysis complete. Use --export to save results.'));
+}
+
+function displaySimpleOverview(stats: any, calculator: CostCalculator) {
+  console.log('\n' + chalk.bold.blue('Claude Code Usage Summary'));
+  console.log(chalk.dim('-'.repeat(40)));
+  
+  console.log(`Total Cost: ${formatCostColored(stats.totalCost)}`);
+  console.log(`Messages: ${chalk.cyan(stats.totalMessages)} (${stats.assistantMessages} AI responses)`);
+  console.log(`Sessions: ${chalk.cyan(stats.totalSessions)}`);
+  console.log(`Duration: ${chalk.cyan(formatDuration(stats.totalDuration))}`);
+  console.log(`Cache Savings: ${chalk.green(calculator.formatCost(stats.cacheSavings))}`);
+  
+  console.log(chalk.dim('\nUse --no-simple for detailed analysis'));
 }
 
 function displayGroupedStats(title: string, groups: GroupedStats[], type: string, detailed: boolean = false, topCount: number = 5) {

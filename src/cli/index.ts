@@ -11,7 +11,6 @@ import { watchCommand } from './commands/watch.js';
 import { statsCommand } from './commands/stats.js';
 import { predictCommand } from './commands/predict.js';
 import { insightsCommand } from './commands/insights.js';
-import { syncCommand } from './commands/sync.js';
 import { dashboardCommand } from './commands/dashboard.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -46,10 +45,12 @@ program
   .option('--format <type>', 'Output format (table, json, csv, html)', 'table')
   .option('--export <file>', 'Export results to file')
   .option('-g, --group-by <type>', 'Group results by (session, project, date, hour)', 'session')
-  .option('--show-all', 'Show all grouping types', false)
   .option('-d, --detailed', 'Show detailed cost breakdown in tables', false)
   .option('--top <n>', 'Number of top results to show (default: 5, hour: 10)', '5')
   .option('--live', 'Show all messages as they would appear in watch mode', false)
+  .option('--simple', 'Show simplified overview only (default: show everything)')
+  .option('--no-daily', 'Skip daily patterns analysis')
+  .option('--no-insights', 'Skip usage insights and recommendations')
   .action(analyzeCommand);
 
 // Watch command
@@ -59,12 +60,21 @@ program
   .option('-p, --path <path>', 'Path to Claude projects directory', '~/.claude/projects')
   .option('-n, --notify', 'Enable desktop notifications', true)
   .option('--min-cost <amount>', 'Minimum cost to trigger notification', '0.01')
-  .option('--sound', 'Enable notification sound', true)
-  .option('--notify-task', 'Enable task completion notifications (when Claude finishes responding)', true)
+  .option('--sound', 'Enable notification sound', false)
+  .option('--session-sound-only', 'Enable sound only for session completion notifications', false)
+  .option('--task-sound <sound>', 'Sound for task completion (macOS: Pop, Ping, Glass, etc.)')
+  .option('--session-sound <sound>', 'Sound for session completion (macOS: Glass, Hero, etc.)')
+  .option('--notify-task', 'Enable task completion notifications (delayed completion only)', true)
   .option('--notify-session', 'Enable session completion notifications (when session ends)', true)
   .option('--notify-cost', 'Enable cost update notifications (for each message)', false)
+  .option('--notify-progress', 'Enable task progress notifications', true)
+  .option('--min-task-cost <amount>', 'Minimum cost for task notifications', '0.01')
+  .option('--min-task-messages <n>', 'Minimum messages for task notifications', '1')
+  .option('--delayed-timeout <ms>', 'Timeout for delayed task completion (default: 30000ms)', '30000')
+  .option('--progress-interval <ms>', 'Interval for progress checks (default: 10000ms)', '10000')
   .option('--include-existing', 'Process all existing messages on startup', false)
   .option('--recent <n>', 'Show only the N most recent messages on startup', '5')
+  .option('--max-age <minutes>', 'Maximum age of messages to display in minutes (default: 5)', '5')
   .option('--test', 'Enable test mode with sample data generation', false)
   .option('--verbose', 'Enable verbose logging for debugging', false)
   .action(watchCommand);
@@ -169,21 +179,6 @@ program
   .option('--format <type>', 'Output format (text, json)', 'text')
   .option('--export <file>', 'Export insights to file')
   .action(insightsCommand);
-
-// Sync command
-program
-  .command('sync')
-  .description('Sync usage data across multiple machines')
-  .option('--export', 'Export data for sync')
-  .option('--import <files...>', 'Import and merge sync files')
-  .option('--compare <path>', 'Compare with remote data')
-  .option('--list', 'List available sync files')
-  .option('-p, --path <path>', 'Path to Claude projects directory', '~/.claude/projects')
-  .option('-o, --output <file>', 'Output file for export')
-  .option('--strategy <type>', 'Merge strategy (newest, oldest, cost, manual)', 'newest')
-  .option('--dry-run', 'Preview changes without applying')
-  .option('--no-backup', 'Skip backup when importing')
-  .action(syncCommand);
 
 // Dashboard command
 program

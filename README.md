@@ -16,7 +16,7 @@ Cost Claude monitors and analyzes your Claude Code usage costs in real-time with
 npx cost-claude@latest watch --notify
 
 # Quick analysis with npx
-npx cost-claude@latest analyzey
+npx cost-claude@latest analyze
 ```
 
 ### Global Installation
@@ -101,8 +101,11 @@ cost-claude watch --notify
 # All notifications including cost updates
 cost-claude watch --notify --notify-cost
 
-# Only task completion notifications
-cost-claude watch --notify --no-notify-session --no-notify-cost
+# Enable task completion notifications with custom sounds
+cost-claude watch --notify --notify-task --sound --task-sound Tink --session-sound Hero
+
+# Only session completion notifications
+cost-claude watch --notify --notify-session --no-notify-task --no-notify-cost
 
 # Show last 10 messages before monitoring
 cost-claude watch --notify --recent 10
@@ -113,7 +116,7 @@ cost-claude watch --notify --recent 10
 Claude Code Cost Watcher
 Real-time monitoring for Claude usage
 Model: claude-opus-4-20250514
-Notifications: Task, Session
+Notifications: Cost, Session
 Showing last 5 messages before monitoring
 
 Watcher initialized
@@ -130,26 +133,53 @@ Press Ctrl+C to stop
 #### Notification Types
 
 **Default Settings:**
-- ✅ **Task completion**: When Claude Code finishes responding (enabled)
+- ⚪ **Task completion**: When Claude Code finishes responding (disabled by default)
 - ✅ **Session completion**: When your work session ends (enabled)
-- ⚪ **Cost updates**: For each message (disabled by default)
+- ✅ **Cost updates**: For each message (enabled)
+
+#### How Detection Works
+
+**🎯 Task Completion Detection:**
+- **Immediate**: Triggered 3 seconds after Claude's last response
+- **Delayed**: Triggered 30 seconds after Claude's last response (more confident)
+- **What it means**: Claude has finished responding to your current question/request
+- **Notification timeout**: 20 seconds (auto-disappears to avoid clutter)
+- **Sound**: Pop (light, quick sound)
+
+**✅ Session Completion Detection:**
+- **Inactivity**: No messages for 5 minutes
+- **Summary message**: Claude sends a session summary
+- **What it means**: Your entire coding session has ended
+- **Notification timeout**: Persistent (stays until manually dismissed)
+- **Sound**: Glass (more substantial, satisfying sound)
+
+**⏳ Task Progress Detection:**
+- **Active monitoring**: During long-running tasks (>20 seconds, >$0.02)
+- **What it means**: Claude is still working on a complex task
+- **Notification timeout**: 10 seconds
+- **Sound**: None (silent updates)
 
 **Example Notifications:**
 
-**Task Completion:**
+**Task Completion (20s timeout):**
 ```
-💬 claude-code-cost-checker - Task Complete
+🎯 claude-code-cost-checker - Task Complete
 ⏱️ 5s • 💬 2 responses
 💰 $0.0299
+🔊 Pop sound
 ```
 
-**Session Completion:**
+**Session Completion (persistent):**
 ```
 ✅ claude-code-cost-checker - Session Complete  
 📝 Code refactoring completed successfully
 ⏱️ 45 min • 💬 23 messages
 💰 Total: $0.2508
+🔊 Glass sound
 ```
+
+**Available Sounds (macOS):**
+`Basso`, `Blow`, `Bottle`, `Frog`, `Funk`, `Glass`, `Hero`, `Morse`, `Ping`, `Pop`, `Purr`, `Sosumi`, `Submarine`, `Tink`
 
 ## 📊 Command Options
 
@@ -171,11 +201,14 @@ Press Ctrl+C to stop
 | Option | Description | Default |
 |--------|-------------|---------|
 | `-n, --notify` | Enable notifications | `true` |
-| `--notify-task` | Task completion notifications | `true` |
+| `--notify-task` | Task completion notifications | `false` |
 | `--notify-session` | Session completion notifications | `true` |
-| `--notify-cost` | Cost update notifications | `false` |
+| `--notify-cost` | Cost update notifications | `true` |
 | `--min-cost <amount>` | Minimum cost for notifications | `0.01` |
-| `--sound` | Enable notification sound | `true` |
+| `--sound` | Enable notification sound | `false` |
+| `--task-sound <sound>` | Custom sound for task completion | `Pop` |
+| `--session-sound <sound>` | Custom sound for session completion | `Glass` |
+| `--max-age <minutes>` | Max age of messages to display | `5` |
 | `--recent <n>` | Show N recent messages | `5` |
 | `--include-existing` | Process all existing messages | `false` |
 
@@ -201,16 +234,38 @@ DEBUG=* cost-claude watch --notify --verbose
    - System Preferences > Notifications & Focus > Terminal
    - Ensure "Allow Notifications" is enabled
    - Set style to "Alerts" or "Banners"
+   - Check "Play sound for notifications"
 
 2. **Reset notification system:**
    ```bash
    sudo killall NotificationCenter
    ```
 
-3. **Test notifications:**
+3. **Test notifications and sounds:**
    ```bash
-   npx cost-claude@latest test:mac-notification
+   # Test default sounds
+   npx tsx scripts/test-notification-sounds.ts
+   
+   # Test timeouts
+   npx tsx scripts/test-notification-timeout.ts
    ```
+
+### Common Issues
+
+**Notifications not appearing:**
+- Check Do Not Disturb mode is disabled
+- Verify Terminal app has notification permissions
+- Old messages might be filtered (adjust `--max-age`)
+
+**Sounds not playing:**
+- Ensure `--sound` flag is used
+- Check system volume and notification sound settings
+- Try different sound names (case-sensitive)
+
+**Task/Session detection not working:**
+- Task completion: Waits 3s after Claude's response
+- Session completion: Triggered by 5min inactivity
+- Use `--verbose` flag to see detection logs
 
 ## 📄 License
 
